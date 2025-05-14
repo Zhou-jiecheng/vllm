@@ -182,9 +182,7 @@ async def build_async_engine_client_from_engine_args(
         try:
             async_llm = AsyncLLM.from_vllm_config(
                 vllm_config=vllm_config,
-                usage_context=usage_context,
-                disable_log_requests=engine_args.disable_log_requests,
-                disable_log_stats=engine_args.disable_log_stats)
+                usage_context=usage_context)
             yield async_llm
         finally:
             if async_llm:
@@ -198,9 +196,7 @@ async def build_async_engine_client_from_engine_args(
         try:
             engine_client = AsyncLLMEngine.from_vllm_config(
                 vllm_config=vllm_config,
-                usage_context=usage_context,
-                disable_log_requests=engine_args.disable_log_requests,
-                disable_log_stats=engine_args.disable_log_stats)
+                usage_context=usage_context)
             yield engine_client
         finally:
             if engine_client and hasattr(engine_client, "shutdown"):
@@ -243,8 +239,8 @@ async def build_async_engine_client_from_engine_args(
         engine_process = context.Process(
             target=run_mp_engine,
             args=(vllm_config, UsageContext.OPENAI_API_SERVER, ipc_path,
-                  engine_args.disable_log_stats,
-                  engine_args.disable_log_requests, engine_alive))
+                  False,
+                  False, engine_alive))
         engine_process.start()
         engine_pid = engine_process.pid
         assert engine_pid is not None, "Engine process failed to start."
