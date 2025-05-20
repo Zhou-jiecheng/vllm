@@ -1865,7 +1865,7 @@ class ParallelConfig:
             "worker_extension_cls must be a string (qualified class name).")
 
 
-PreemptionMode = Literal["swap", "recompute"]
+PreemptionMode = Literal["swap", "recompute","hybrid"]
 SchedulerPolicy = Literal["fcfs", "priority"]
 
 

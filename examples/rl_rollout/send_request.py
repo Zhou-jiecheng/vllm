@@ -1,5 +1,6 @@
 import random
 import string
+import datetime 
 import uuid
 import numpy as np
 from typing import List, Dict, Any, Optional
@@ -111,31 +112,33 @@ def generate_workload_distributed_lengths(workload_bins, num_requests):
     random.shuffle(output_lengths)
     return output_lengths
 
-def gen_dummy_request_config(prompt_len, output_len):
-    """生成单个请求配置"""
-    return RequestConfig(
-        prompt_len=prompt_len,
-        output_len=output_len,
-        request_id=str(uuid.uuid4()),
-        input_ids=random_input_ids(prompt_len),
-        sampling_params={
-            "temperature": 0.9,
-            "top_p": 1,
-            "do_sample": False
-        },
-        ignore_eos=True
-    )
-
 def gen_dummy_requests(n, workload_bins):
-    """生成n个请求配置，确保每个区间都被采样"""
+    """生成n个请求配置，每8个request使用相同的input_ids"""
     # 生成输出长度
     output_lengths = generate_workload_distributed_lengths(workload_bins, n)
     
     # 生成请求配置
     requests = []
-    for output_len in output_lengths:
+    for i in range(0, n, 8):
+        # 每8个request生成一次input_ids
         prompt_len = generate_normal_distributed_length()
-        requests.append(gen_dummy_request_config(prompt_len, output_len))
+        input_ids = random_input_ids(prompt_len)
+        
+        # 使用相同的input_ids生成8个request
+        for j in range(8):
+            if i + j < n:  # 确保不超出总请求数
+                requests.append(RequestConfig(
+                    prompt_len=prompt_len,
+                    output_len=output_lengths[i + j],
+                    request_id=str(uuid.uuid4()),
+                    input_ids=input_ids,
+                    sampling_params={
+                        "temperature": 0.9,
+                        "top_p": 1,
+                        "do_sample": False
+                    },
+                    ignore_eos=True
+                ))
     
     return requests
 
@@ -167,6 +170,9 @@ def send_vllm_request(payload):
 
 if __name__ == "__main__":
     # 加载workload数据并创建区间
+    RANDOM_SEED = 42  # 可以设置为任意整数
+    random.seed(RANDOM_SEED)
+    np.random.seed(RANDOM_SEED)
     workload_data = load_workload_data()
     workload_bins = create_workload_bins(workload_data, num_bins=16)
     
@@ -205,6 +211,7 @@ if __name__ == "__main__":
     print(f"\n开始发送请求到 {VLLM_API_URL} ...\n")
 
     # 发送请求
+    start_time = datetime.datetime.now()
     results = []
     with ThreadPoolExecutor(max_workers=BATCH_SIZE) as executor:
         future_to_idx = {executor.submit(send_vllm_request, p): i for i, p in enumerate(payloads)}
@@ -215,9 +222,6 @@ if __name__ == "__main__":
                 results.append((idx, res))
             except Exception as exc:
                 results.append((idx, {"error": "exception", "detail": str(exc)}))
-
-    # 按顺序输出结果
-    for idx, res in sorted(results):
-        print(f"--- Response for Request #{idx+1} ---")
-        print(res)
-        print()
+    end_time = datetime.datetime.now()
+    print(f"结束时间: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"总耗时: {end_time - start_time}")

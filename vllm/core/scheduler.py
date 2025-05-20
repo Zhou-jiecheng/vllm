@@ -25,11 +25,18 @@ logger = init_logger(__name__)
 
 # Test-only. If configured, decode is preempted with
 # ARTIFICIAL_PREEMPTION_PROB% probability.
-ENABLE_ARTIFICIAL_PREEMPT = bool(
-    os.getenv("VLLM_TEST_ENABLE_ARTIFICIAL_PREEMPT", False))  # noqa
-ARTIFICIAL_PREEMPTION_PROB = 0.5
-ARTIFICIAL_PREEMPTION_MAX_CNT = 500
+ENABLE_ARTIFICIAL_PREEMPT = False # noqa
+ARTIFICIAL_PREEMPTION_PROB = 1
+ARTIFICIAL_PREEMPTION_MAX_CNT = 10000
 
+def get_bool_env(var_name, default=False):
+    val = os.getenv(var_name)
+    if val is None:
+        return default
+    val = val.lower()
+    if val in ('false', 'f', '0', 'no', 'n', 'off'):
+        return False
+    return True
 
 class PreemptionMode(enum.Enum):
     """Preemption modes.
@@ -39,10 +46,12 @@ class PreemptionMode(enum.Enum):
     2. Recomputation: Discard the blocks of the preempted sequences and
     recompute them when the sequences are resumed, treating the sequences as
     new prompts.
+    3. Hybrid: Use a combination of swapping and recomputation based on sequence characteristics.
     """
 
     SWAP = enum.auto()
     RECOMPUTE = enum.auto()
+    HYBRID = enum.auto()
 
 
 @dataclass
@@ -494,7 +503,7 @@ class Scheduler:
                                        if self.enable_artificial_preemption
                                        else 0)
         self.num_cumulative_preemption: int = 0
-
+        self.schedule_step: int = 0
         # Used to cache python objects
         self._seq_group_metadata_cache: List[PyObjectCache] = []
         self._scheduler_running_outputs_cache: List[PyObjectCache] = []
@@ -504,9 +513,13 @@ class Scheduler:
         # iterations. I.e. since the output processing is lagged one step,
         # we cannot reuse the cached objects immediately when the schedule()
         # is called again, but only when schedule() is called the second time.
-        self.output_proc_callback = output_proc_callback
+        self.output_proc_callback = None
         self.use_async_output_proc = self.output_proc_callback is not None
         self.num_cache_iters = 2 if self.use_async_output_proc else 1
+        
+        self.preemption_status = {}
+        self.preemption_test = get_bool_env("VLLM_TEST_ARTIFICIAL_PREEMPT",False)
+        self.preemption_len = int(os.getenv("PREEMPTION_LENGTH", 4000))
 
         self.cache_id = 0
         for i in range(self.num_cache_iters):
@@ -759,6 +772,26 @@ class Scheduler:
                     victim_seq_group = seq_group
                     cont_loop = False
 
+                # 在preemption发生前打印当前running sequences的信息
+                print("\nPreemption occurs - Current running sequences:")
+                self.seq_preemption_lengths = []
+                for running_seq_group in self.running:
+                    for seq in running_seq_group.get_seqs():
+                        self.seq_preemption_lengths.append(seq.get_len())
+                print(f"Preemption occurs - sequence length list:", self.seq_preemption_lengths)
+                
+                # 打印被抢占的request信息
+                print("\nVictim request information:")
+                print(f"Request ID: {victim_seq_group.request_id}")
+                print(f"Number of sequences: {len(victim_seq_group.get_seqs())}")
+                for seq in victim_seq_group.get_seqs():
+                    print(f"  Sequence {seq.seq_id}:")
+                    print(f"    Length: {seq.get_len()}")
+                    print(f"    Status: {seq.status}")
+                    print(f"    Stage: {seq.data.stage}")
+                    print(f"    Is prefill: {seq.is_prefill()}")
+                print()
+
                 # With async postprocessor, before preempting a sequence
                 # we need to ensure it has no pending async postprocessor
                 do_preempt = True
@@ -772,15 +805,17 @@ class Scheduler:
                     if victim_seq_group.is_finished():
                         self._free_finished_seq_group(victim_seq_group)
                         do_preempt = False
-
+                print("do preemption:", do_preempt)
                 # Do preemption
                 if do_preempt:
+                    print("Invoke _preempt()")
                     preempted_mode = self._preempt(victim_seq_group,
                                                    blocks_to_swap_out)
                     if preempted_mode == PreemptionMode.RECOMPUTE:
                         preempted.append(victim_seq_group)
                     else:
                         swapped_out.append(victim_seq_group)
+                        print("Swapping out victim sequence group")
 
                 if not cont_loop:
                     break
@@ -1377,7 +1412,7 @@ class Scheduler:
         prefills = SchedulerPrefillOutputs.create_empty()
         swapped_in = SchedulerSwappedInOutputs.create_empty()
 
-        # Create partial prefill metadata
+        # Create partial prefill metadata    
         partial_prefill_metadata = PartialPrefillMetadata.from_queues(
             running=self.running,
             waiting=self.waiting,
@@ -1502,6 +1537,11 @@ class Scheduler:
                 and self.artificial_preempt_cnt > 0):
             self.artificial_preempt_cnt -= 1
             return False
+        # support there only one sequence in the group
+        if self.preemption_test and self.user_specified_preemption_mode == "recompute":
+            if seq_group.request_id not in self.preemption_status and seq_group.get_seqs()[0].get_len() >= self.preemption_len:
+                self.preemption_status[seq_group.request_id] = True
+                return False
 
         is_prefill = seq_group.is_prefill()
         num_lookahead_slots = self._get_num_lookahead_slots(
@@ -1531,7 +1571,85 @@ class Scheduler:
         scheduler_start_time = time.perf_counter()
 
         scheduler_outputs: SchedulerOutputs = self._schedule()
+        
+        if self.schedule_step % 10000 == 0:
+            self.seq_lengths = []
+            print(f"\nStep {self.schedule_step} - Scheduler Outputs:")
+            print(f"Number of scheduled sequence groups: {len(scheduler_outputs.scheduled_seq_groups)}")
+            for i, scheduled_seq_group in enumerate(scheduler_outputs.scheduled_seq_groups):
+                seq_group = scheduled_seq_group.seq_group
+                for seq in seq_group.get_seqs():
+                    self.seq_lengths.append(seq.get_len())
+            print(f"Step {self.schedule_step} - sequence length list:", self.seq_lengths)
+            
+        self.schedule_step += 1
         now = time.time()
+
+        if self.preemption_test and self.user_specified_preemption_mode == "swap":
+            for i, scheduled_seq_group in enumerate(scheduler_outputs.scheduled_seq_groups):
+                seq_group = scheduled_seq_group.seq_group
+                request_id = seq_group.request_id
+                
+                # 检查该请求是否已经经历过preemption
+                if request_id not in self.preemption_status:
+                    self.preemption_status[request_id] = False
+                
+                # 只对未经历过preemption且不是prefill阶段的请求进行人工抢占测试
+                if not self.preemption_status[request_id] and not seq_group.is_prefill() and seq_group.get_seqs()[0].get_len() >= self.preemption_len:
+                    print(f"\nPerforming artificial preemption test on request {request_id}")
+                    
+                    # 获取序列长度信息
+                    seq_lengths = [seq.get_len() for seq in seq_group.get_seqs()]
+                    print(f"Sequence lengths: {seq_lengths}")
+
+                    seq_len_max = max(seq_lengths)
+                    # if seq_len_max <= 3000:
+                    #     break
+                    # 临时存储swap out的块信息
+                    blocks_to_swap_out = []
+                    
+                    # 根据配置的模式执行对应的preemption操作
+                    if self.user_specified_preemption_mode == "swap":
+                        self._preempt_by_swap(seq_group, blocks_to_swap_out)
+                        used_mode = PreemptionMode.SWAP
+                    elif self.user_specified_preemption_mode == "recompute":
+                        # 只对单序列请求执行recompute
+                        if seq_group.get_max_num_running_seqs() == 1:
+                            self._preempt_by_recompute(seq_group)
+                            used_mode = PreemptionMode.RECOMPUTE
+                        else:
+                            self._preempt_by_swap(seq_group, blocks_to_swap_out)
+                            used_mode = PreemptionMode.SWAP
+                    else:
+                        # 默认行为
+                        if seq_group.get_max_num_running_seqs() == 1:
+                            self._preempt_by_recompute(seq_group)
+                            used_mode = PreemptionMode.RECOMPUTE
+                        else:
+                            self._preempt_by_swap(seq_group, blocks_to_swap_out)
+                            used_mode = PreemptionMode.SWAP
+                    
+                    # 更新preemption状态，标记已经进行过人工抢占
+                    self.preemption_status[request_id] = True
+                    
+                    print(f"Artificial preemption completed with mode {used_mode}")
+                    
+                    # 恢复状态，以便请求可以继续处理
+                    if used_mode == PreemptionMode.SWAP:
+                        blocks_to_swap_in = []
+                        self._swap_in(seq_group, blocks_to_swap_in)
+                    elif used_mode == PreemptionMode.RECOMPUTE:
+                        # 为了测试而记录状态，但不需要添加回waiting队列
+                        # 因为这只是一个人为测试，我们希望请求继续处理
+                        # 我们只需要模拟抢占过程并测量时间
+                        # 在真实的系统中，可能需要进一步处理被抢占的请求
+                        pass
+                    print("blocks_to_swap_out:",blocks_to_swap_out)
+                    print("blocks_to_swap_in:",blocks_to_swap_in)
+                    scheduler_outputs.blocks_to_swap_out = blocks_to_swap_out
+                    scheduler_outputs.blocks_to_swap_in = blocks_to_swap_in
+                    # 只对一个请求进行测试，然后退出循环
+                    break
 
         if not self.cache_config.enable_prefix_caching:
             common_computed_block_nums = []
@@ -1796,6 +1914,7 @@ class Scheduler:
         else:
             preemption_mode = PreemptionMode.RECOMPUTE
 
+        print(f"Preemption mode: {preemption_mode}")
         if self.num_cumulative_preemption % 2 == 0:
             logger.warning(
                 "Sequence group %s is preempted by %s mode because there is "
@@ -1810,12 +1929,50 @@ class Scheduler:
         self.num_cumulative_preemption += 1
 
         if preemption_mode == PreemptionMode.RECOMPUTE:
+            print("Invoke _preempt_by_recompute!!")
             self._preempt_by_recompute(seq_group)
+            return PreemptionMode.RECOMPUTE
         elif preemption_mode == PreemptionMode.SWAP:
+            print("Invoke _preempt_by_swap!!")
             self._preempt_by_swap(seq_group, blocks_to_swap_out)
+            return PreemptionMode.SWAP
+        elif preemption_mode == PreemptionMode.HYBRID:
+            print("Invoke _preempt_hybrid!!")
+            return self._preempt_hybrid(seq_group, blocks_to_swap_out)
         else:
             raise AssertionError("Invalid preemption mode.")
-        return preemption_mode
+
+    def _preempt_hybrid(
+        self,
+        seq_group: SequenceGroup,
+        blocks_to_swap_out: List[Tuple[int, int]],
+    ) -> PreemptionMode:
+        """Implement a hybrid preemption strategy that decides between recompute and swap
+        based on sequence characteristics such as sequence length and number of sequences.
+        
+        Returns the actual preemption mode used (RECOMPUTE or SWAP).
+        """
+        # 获取序列长度
+        seq_lengths = [seq.get_len() for seq in seq_group.get_seqs()]
+        max_length = max(seq_lengths) if seq_lengths else 0
+        
+        # 获取序列数量
+        num_seqs = seq_group.get_max_num_running_seqs()
+        
+        # 设置阈值，可以通过配置参数调整
+        length_threshold = self.scheduler_config.hybrid_preemption_length_threshold if hasattr(
+            self.scheduler_config, 'hybrid_preemption_length_threshold') else 7000
+        
+        # 决策逻辑：对于长序列或多序列组使用swap，对于短序列使用recompute
+        # 长序列重新计算代价太高，多序列组当前不支持recompute
+        if max_length > length_threshold or num_seqs > 1:
+            # swap
+            self._preempt_by_swap(seq_group, blocks_to_swap_out)
+            return PreemptionMode.SWAP
+        else:
+            # recompute
+            self._preempt_by_recompute(seq_group)
+            return PreemptionMode.RECOMPUTE
 
     def _preempt_by_recompute(
         self,

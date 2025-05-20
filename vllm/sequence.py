@@ -327,10 +327,12 @@ class SequenceData(msgspec.Struct,
                         token_id: int,
                         logprob: float,
                         token_embed: Optional[torch.Tensor] = None) -> None:
+        # print(f"Appending token {token_id} to sequence, current length: {self.get_len()}")
         self._output_token_ids.append(token_id)
         self._new_appended_tokens.append(token_id)
         self._cached_all_token_ids.append(token_id)
         self._cumulative_logprob += logprob
+        # print(f"New sequence length after append: {self.get_len()}")
         if token_embed is not None:
             # Do not pass in with batch or sequence dimensions
             assert token_embed.ndim == 1
